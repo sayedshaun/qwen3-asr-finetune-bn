@@ -1,0 +1,16 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.11.0+cu128
+# Qwen3-ASR is supported natively from transformers v5.13.0.
+transformers>=5.13.0
+accelerate>=1.10.0
+datasets==4.4.1
+peft>=0.18.0
+jiwer==4.0.0
+soundfile==0.14.0
+pydub==0.25.1
+librosa>=0.11.0
+pyyaml==6.0.3
+pandas==2.3.3
+tqdm==4.70.0
+wandb==0.28.1
+python-dotenv==1.2.2
