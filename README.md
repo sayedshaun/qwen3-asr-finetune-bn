@@ -1,45 +1,47 @@
 # qwen3-asr-finetune-bn
 
-Fine-tunes [Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B-hf) for **Bengali (Bangla)**.
+Fine-tunes the **Qwen3-ASR family** — any checkpoint `transformers` can load as
+`Qwen3ASRForConditionalGeneration`, including
+[Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B-hf) — on any language or
+domain. Bengali (Bangla) is the worked example shipped in `config.yaml`.
 
-## Why
+Nothing in the pipeline is tied to one model size or one language. The checkpoint comes
+from `train.model_id` and the language from `train.language_tag`; both are plain config
+values, so pointing this at a different family member or a different language is a
+config edit, not a code change:
 
-Qwen3-ASR ships with 30 languages — Chinese, English, Cantonese, Arabic, German, French,
-Spanish, Portuguese, Indonesian, Italian, Korean, Russian, Thai, Vietnamese, Japanese,
-Turkish, Hindi, Malay, Dutch, Swedish, Danish, Finnish, Polish, Czech, Filipino, Persian,
-Greek, Hungarian, Macedonian, Romanian. **Bengali is not among them.**
+```bash
+python train.py --set model_id=Qwen/Qwen3-ASR-0.6B-hf --set language_tag=Bengali
+python train.py --set model_id=<any-qwen3-asr-checkpoint> --set language_tag=Tamil
+```
 
-Measured on the base model with Bangla news audio:
+Larger checkpoints need proportionally more VRAM; the knobs in [Tuning](#tuning)
+(`use_lora`, `max_duration`, `gradient_checkpointing`) are what make that tractable.
 
-| Setting | Output |
-|---|---|
-| Auto-detect | Identifies the audio as **Hindi** and transcribes into Devanagari |
-| Forced `language Bengali` | Bangla script, but heavy word errors (`যোমোকাশমিট্টেকের` for জম্মু কাশ্মীর থেকে) |
-
-So the model's audio encoder clearly hears Bangla phonetics — it just has no
-Bengali text mapping. That is what this pipeline trains.
-
-It is worth knowing what you are trading. Gemma-4-E4B (Q4_K_XL) transcribes the
-same audio usably today at ~10–12 tok/s and ~6 GB. Qwen3-ASR-0.6B runs at
-~50 tok/s in ~1 GB — **5× faster in a fifth the space** — which is the whole
-reason to spend the training run.
+Bengali is the example because it is not one of the model's 30 pretrained languages.
+Left to auto-detect it identifies Bangla audio as Hindi and transcribes into Devanagari,
+so this pipeline teaches it the language while keeping the model's native output format.
+The same applies to any unsupported language you point it at.
 
 ## Layout
 
-The data layer is reused **verbatim** from `conformer-training-pipeline`:
-`prepare_data.py`, `src/config.py`, `src/audio.py` and all of `src/opends/`.
-Manifests built there work here unchanged, and vice versa.
-
 ```
 config.yaml       data / train / eval sections
-prepare_data.py   download sources -> NeMo manifests   (reused)
+prepare_data.py   fetch sources -> NeMo manifests
 train.py          fine-tune
 eval.py           WER / CER on a manifest
 infer.py          transcribe files with a checkpoint
-src/dataset.py    manifest -> Qwen3-ASR chat format    (new)
-src/training.py   model build + Trainer loop           (new)
-src/evaluation.py generation + jiwer scoring           (new)
-src/opends/       mcv, openslr, fleurs, ...            (reused)
+src/dataset.py    manifest -> Qwen3-ASR chat format
+src/training.py   model build + Trainer loop
+src/evaluation.py generation + jiwer scoring
+src/callbacks.py  periodic sample transcription during training
+src/opends/       dataset preparers: mcv, openslr, fleurs, cv_parquet, ...
+```
+
+Manifests are NeMo-style JSONL, one object per line:
+
+```json
+{"audio_filepath": "data/wavs/clip_001.wav", "text": "বাংলা প্রতিলিপি", "duration": 8.4}
 ```
 
 ## Setup
@@ -50,14 +52,15 @@ pip install -r requirements.txt
 cp .env.example .env          # add MDC_API_KEY for the mcv source
 ```
 
-Qwen3-ASR needs **transformers ≥ 5.13.0**; earlier versions cannot load
-`Qwen3ASRForConditionalGeneration`.
+Qwen3-ASR needs **transformers >= 5.13.0**; earlier versions cannot load
+`Qwen3ASRForConditionalGeneration`. Use **peft >= 0.21**; older releases fail against
+transformers 5.x with `ImportError: cannot import name 'HybridCache'`.
 
 ## Run
 
 ```bash
-python prepare_data.py                      # all sources in config.yaml
-python prepare_data.py --dataset fleurs     # just one, for a fast first pass
+python prepare_data.py                      # every source in config.yaml
+python prepare_data.py --dataset fleurs     # one source, for a fast first pass
 python train.py
 python eval.py
 python infer.py sample.wav
@@ -67,82 +70,71 @@ Every entrypoint takes `--set key=value` overrides against its config section:
 
 ```bash
 python train.py --set learning_rate=2e-5 --set per_device_train_batch_size=4
-python eval.py --set model_path=Qwen/Qwen3-ASR-0.6B-hf   # baseline before training
+python train.py --resume                                  # latest checkpoint in output_dir
+python eval.py --set model_path=Qwen/Qwen3-ASR-0.6B-hf    # score the base model
 ```
 
-Get that baseline number before you train anything — it is the only way to know
-whether the run helped.
+Score the base model before training. Without that number there is no way to tell
+whether a run helped.
 
-## How the target is built
+## Data sources
 
-Qwen3-ASR is trained on its own chat format, with the transcript in the
-assistant turn using the model's native output format:
+Add entries under `data.sources` in `config.yaml`. Each needs a `type` from
+`prepare_data.py`'s `PREPARERS`, and writes its own manifest before they are merged
+and re-split by `data.split_ratio`.
+
+```yaml
+data:
+  sources:
+    - type: fleurs
+      name: fleurs
+    - type: cv_parquet          # Common Voice parquet shards already on disk
+      name: cv
+      files: "/path/to/validated-*-of-*.parquet"
+      locale: bn
+```
+
+To train on your own audio, write a manifest in the format above and point at it
+directly, no code change:
+
+```bash
+python train.py --set train_manifest=data/my_train.json --set val_manifest=data/my_dev.json
+```
+
+Utterances with empty text, missing audio, or a duration outside
+`min_duration`/`max_duration` are dropped, and the counts are reported.
+
+## How the training target is built
+
+The transcript goes in the assistant turn using the model's native output format:
 
 ```
 language Bengali<asr_text>আজকের সংবাদ
 ```
 
+The tag is whatever `train.language_tag` is set to, so the same mechanism carries over
+to any language you train.
+
 Keeping the `language <NAME><asr_text>` prefix preserves the pretrained
-language-identification behaviour; training on a bare transcript throws it
-away. `processor.apply_chat_template(..., processor_kwargs={"output_labels": True})`
-builds the labels and masks audio and padding positions itself, so this repo
-does no hand-rolled label masking.
+language-identification behaviour; training on a bare transcript throws it away.
+
+`processor.apply_chat_template(..., processor_kwargs={"output_labels": True, "padding": True})`
+builds the labels and masks audio and padding positions itself, so this repo does no
+hand-rolled label masking. Both keys must sit inside `processor_kwargs` — passing
+either as a top-level kwarg makes the processor silently drop both, and training then
+fails at `loss.backward()` with `loss=None`.
 
 ## Tuning
 
 | Knob | Effect |
 |---|---|
-| `max_duration` | Audio is ~13 tokens/second, so this is the real memory knob |
-| `freeze_audio_encoder` | Trains the decoder only. Cheaper, but usually worse when teaching a new script |
-| `use_lora` | LoRA via peft instead of a full finetune. Needed under ~8 GB VRAM |
+| `max_duration` | Audio dominates sequence length, so this is the main memory knob |
+| `use_lora` | LoRA via peft instead of a full finetune |
 | `gradient_checkpointing` | On by default; trades compute for memory |
+| `freeze_audio_encoder` | Trains the decoder only; cheaper, usually worse for a new script |
+| `gradient_accumulation_steps` | Raise this when batch size is memory-bound |
+| `per_device_eval_batch_size` | Evaluation upcasts logits to fp32 over a 151936-token vocab; keep it low |
+| `sample_audio` | Clip transcribed every `sample_every_steps`, to watch progress as text |
 
-A full bf16 finetune of 0.6B needs roughly 7–8 GB for weights plus optimizer
-states before activations, so it will not fit on a 4 GB card — use `use_lora: true`
-there, or train on a larger GPU.
-
-## Status
-
-Verified end to end on an RTX 2050 (4 GB): LoRA training steps, the eval loop,
-checkpoint saving, and the sample-transcription callback all run. What has
-*not* run is a real dataset download or a full training run.
-
-Environment used: torch 2.13.0+cu130, transformers 5.17.0, peft 0.21.0.
-peft <0.21 fails against transformers 5.x with
-`ImportError: cannot import name 'HybridCache'`.
-
-### Measured on a 4 GB RTX 2050 (LoRA, r=32, bf16, gradient checkpointing)
-
-23.3M trainable of 805.7M (2.89%); weights sit at ~1.58 GB before activations.
-
-| Config | Step time | Peak VRAM |
-|---|---|---|
-| bs=1, 10s audio | 0.47s | 2325 MiB |
-| bs=1, 15s audio | 0.56s | 2482 MiB |
-| bs=1, 20s audio | 0.69s | 2647 MiB |
-| bs=1, 30s audio | **OOM** | — |
-| bs=2, 10s audio | **OOM** | — |
-
-So a 4 GB card is limited to **batch size 1 and `max_duration` ≈ 20** — use
-`gradient_accumulation_steps` for an effective batch. Set
-`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`; it measurably helps at this
-margin. A full (non-LoRA) finetune does not fit.
-
-### Two API traps, both already handled here
-
-**`padding` and `output_labels` must both live inside `processor_kwargs`.**
-Passing either as a top-level kwarg to `apply_chat_template` makes the
-processor log a warning and then silently drop *both*, so the batch arrives
-with no `labels`, the model returns `loss=None`, and training dies at
-`loss.backward()` with `AttributeError: 'NoneType' object has no attribute
-'backward'` — which reads like a model bug and is not.
-
-**transformers 5.x removed `warmup_ratio`** (and `evaluation_strategy`). Use
+`transformers` 5.x removed `warmup_ratio` and `evaluation_strategy`; use
 `warmup_steps` and `eval_strategy`.
-
-## Deploying the result
-
-llama.cpp serves Qwen3-ASR through `ggml-org/Qwen3-ASR-0.6B-GGUF` (Q8_0 weights
-plus a separate mmproj). Converting a fine-tuned checkpoint means running
-llama.cpp's `convert_hf_to_gguf.py` and quantizing — the sibling
-`llamacpp-inference-server` repo already has the serving side set up.
