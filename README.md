@@ -1,10 +1,27 @@
 # qwen3-asr-finetune-bn
 
-Fine-tunes [Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B-hf) for **Bengali (Bangla)**.
+Fine-tunes the **Qwen3-ASR family** — any checkpoint `transformers` can load as
+`Qwen3ASRForConditionalGeneration`, including
+[Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B-hf) — on any language or
+domain. Bengali (Bangla) is the worked example shipped in `config.yaml`.
 
-Bengali is not one of the model's 30 pretrained languages. Left to auto-detect it
-identifies Bangla audio as Hindi and transcribes into Devanagari, so this pipeline
-teaches it the language while keeping the model's native output format.
+Nothing in the pipeline is tied to one model size or one language. The checkpoint comes
+from `train.model_id` and the language from `train.language_tag`; both are plain config
+values, so pointing this at a different family member or a different language is a
+config edit, not a code change:
+
+```bash
+python train.py --set model_id=Qwen/Qwen3-ASR-0.6B-hf --set language_tag=Bengali
+python train.py --set model_id=<any-qwen3-asr-checkpoint> --set language_tag=Tamil
+```
+
+Larger checkpoints need proportionally more VRAM; the knobs in [Tuning](#tuning)
+(`use_lora`, `max_duration`, `gradient_checkpointing`) are what make that tractable.
+
+Bengali is the example because it is not one of the model's 30 pretrained languages.
+Left to auto-detect it identifies Bangla audio as Hindi and transcribes into Devanagari,
+so this pipeline teaches it the language while keeping the model's native output format.
+The same applies to any unsupported language you point it at.
 
 ## Layout
 
@@ -95,6 +112,9 @@ The transcript goes in the assistant turn using the model's native output format
 language Bengali<asr_text>আজকের সংবাদ
 ```
 
+The tag is whatever `train.language_tag` is set to, so the same mechanism carries over
+to any language you train.
+
 Keeping the `language <NAME><asr_text>` prefix preserves the pretrained
 language-identification behaviour; training on a bare transcript throws it away.
 
@@ -118,9 +138,3 @@ fails at `loss.backward()` with `loss=None`.
 
 `transformers` 5.x removed `warmup_ratio` and `evaluation_strategy`; use
 `warmup_steps` and `eval_strategy`.
-
-## Deploying the result
-
-llama.cpp serves Qwen3-ASR through `ggml-org/Qwen3-ASR-0.6B-GGUF` (Q8_0 weights plus a
-separate mmproj). Converting a fine-tuned checkpoint means merging the adapter, then
-running llama.cpp's `convert_hf_to_gguf.py` and quantizing.
