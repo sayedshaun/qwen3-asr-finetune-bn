@@ -1,0 +1,101 @@
+# ---------------------------------------------------------------------------
+# Data — same sources and semantics as conformer-training-pipeline. The whole
+# data layer (prepare_data.py, src/opends/*) is reused verbatim, so manifests
+# built there drop straight in here.
+# ---------------------------------------------------------------------------
+data:
+  output_dir: data
+  workers: 8
+  skip_download: false
+  sources:
+    - type: mcv
+      name: mcv
+      dataset_id: cmqim44fo00tinr07mbu70eg7
+      splits: [train, dev, test]
+    - type: openslr
+      name: openslr
+      shards: all
+      dev_utterances: 500
+      test_utterances: 500
+    - type: fleurs
+      name: fleurs
+    # Common Voice parquet shards already on disk — no MDC_API_KEY needed.
+    # ~5.5k utterances, ~10h, ~1000 speakers; adds the speaker diversity that
+    # FLEURS (professional read speech, few voices) does not have.
+    - type: cv_parquet
+      name: cv
+      files: "data/cv_parquet/validated-*-of-*.parquet"
+      locale: bn
+  # 58 test utterances (the old 98/0.67/1.33 on fleurs alone) gave WER wide
+  # error bars. This yields ~150 dev / ~250 test across both sources.
+  split_ratio: {train: 96, dev: 1.5, test: 2.5}
+
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
+train:
+  model_id: Qwen/Qwen3-ASR-0.6B-hf
+  train_manifest: data/train_manifest.json
+  val_manifest: data/dev_manifest.json
+  output_dir: experiments/qwen3-asr-bn
+
+  # Qwen3-ASR has no Bengali in its 30 pretrained languages. We keep the
+  # model's native output format (`language <NAME><asr_text>...`) and teach it
+  # this tag, rather than inventing a new one — that preserves the pretrained
+  # behaviour the model card warns about losing.
+  language_tag: Bengali
+
+  # Utterances outside this range are dropped. Audio dominates sequence
+  # length (~13 tokens/second), so the max is really a memory knob.
+  min_duration: 0.5
+  max_duration: 30.0
+
+  freeze_audio_encoder: false   # true = train the text decoder only (cheaper, usually worse for a new script)
+  use_lora: false               # true = LoRA via peft instead of a full finetune
+  lora_r: 32
+  lora_alpha: 64
+  lora_dropout: 0.05
+  lora_target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+  bf16: true
+  gradient_checkpointing: true
+  per_device_train_batch_size: 8
+  # Keep at 1 on small GPUs: the loss upcasts logits to fp32, and with a
+  # 151936-token vocab an eval batch of 8 allocates ~1.45 GiB of logits alone.
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 4
+  learning_rate: 1e-5
+  warmup_steps: 500
+  lr_scheduler_type: linear
+  weight_decay: 0.01
+  num_train_epochs: 3
+  max_steps: -1                 # >0 overrides num_train_epochs
+  eval_steps: 1000
+  save_steps: 1000
+  logging_steps: 25
+  save_total_limit: 3
+  dataloader_num_workers: 8
+  seed: 42
+  report_to: wandb              # or "none"
+  run_name: qwen3-asr-bn-v1
+
+  # Transcribe one fixed clip every N steps so progress is visible as text,
+  # not just loss. Audio is ~13 tokens/second and this runs with the optimizer
+  # states resident, so sample_max_seconds is a real memory knob on small GPUs.
+  sample_audio: "data/samples/sample.mp3"
+  sample_every_steps: 200
+  sample_max_seconds: 20
+  sample_max_new_tokens: 256
+  sample_reference: null
+
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+eval:
+  model_path: experiments/qwen3-asr-bn
+  manifest: data/test_manifest.json
+  language_tag: Bengali
+  batch_size: 8
+  max_new_tokens: 256
+  normalize: true               # strip punctuation / fold whitespace before scoring
+  output_predictions: experiments/qwen3-asr-bn/predictions.jsonl
