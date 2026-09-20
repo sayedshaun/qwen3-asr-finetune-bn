@@ -18,6 +18,18 @@ that tractable.
 python train.py --set model_id=Qwen/Qwen3-ASR-0.6B-hf
 ```
 
+## Trained adapter
+
+The LoRA adapter produced by this pipeline is published at
+[SayedShaun/Qwen3-ASR-0.6B-Bengali-LoRA](https://huggingface.co/SayedShaun/Qwen3-ASR-0.6B-Bengali-LoRA).
+It is an unmerged adapter over `Qwen/Qwen3-ASR-0.6B-hf`, so `eval.py` and `infer.py`
+take it directly and `disable_adapter()` restores the base model exactly.
+
+```bash
+hf download SayedShaun/Qwen3-ASR-0.6B-Bengali-LoRA --local-dir experiments/bn-lora
+python eval.py --set model_path=experiments/bn-lora
+```
+
 ## Layout
 
 ```
