@@ -2,11 +2,25 @@
 # Data — same sources and semantics as conformer-training-pipeline. The whole
 # data layer (prepare_data.py, src/opends/*) is reused verbatim, so manifests
 # built there drop straight in here.
+#
+# ALREADY SATISFIED — do not run prepare_data.py. data/ is wired to the
+# conformer pipeline's corpus so nothing is downloaded twice:
+#
+#   data/wavs -> /home/user/shaun/conformer-training-pipeline/data/wavs  (symlink, 104G)
+#   data/{train,dev,test}_manifest.json                                 (copied, 772605/5282/10485 utts)
+#
+# The manifests use paths relative to the project root ("data/wavs/..."), so
+# every command below must be run from this directory. They were built from a
+# wider source mix than `sources:` lists here (+ben10, openslr37, shrutilipi,
+# kathbath, indicvoices, vaani) and split 98/0.67/1.33, not the ratio below.
+# The `sources:`/`split_ratio:` entries are kept only to document how to
+# rebuild from scratch; editing them changes nothing unless you re-run
+# prepare_data.py, which would re-download ~85G.
 # ---------------------------------------------------------------------------
 data:
   output_dir: data
   workers: 8
-  skip_download: false
+  skip_download: true   # corpus is already on disk, shared with conformer-training-pipeline
   sources:
     - type: mcv
       name: mcv
@@ -35,8 +49,11 @@ data:
 # ---------------------------------------------------------------------------
 train:
   model_id: Qwen/Qwen3-ASR-0.6B-hf
+  # 5 GB VRAM budget + a 3-4 day wall clock, LoRA over the full 1208 h pool.
+  # The full pooled corpus: 758912 utterances / 1208 h across 9 sources.
   train_manifest: data/train_manifest.json
-  val_manifest: data/dev_manifest.json
+  # 750-utt slice: the full 5198-utt dev set costs ~1 h of generation per eval.
+  val_manifest: data/dev_small.json
   output_dir: experiments/qwen3-asr-bn
 
   # Qwen3-ASR has no Bengali in its 30 pretrained languages. We keep the
@@ -48,54 +65,122 @@ train:
   # Utterances outside this range are dropped. Audio dominates sequence
   # length (~13 tokens/second), so the max is really a memory knob.
   min_duration: 0.5
-  max_duration: 30.0
+  # 20 s keeps 97.5% of utterances (1174 h of the 1208 h; p99 is 19.3 s) and
+  # bounds the worst case. Logits dominate peak memory - 151936-vocab, upcast
+  # to fp32 by the loss - so the longest clip in a batch sets the OOM risk,
+  # and a 40 s outlier crashing the run on day 3 is not worth the last 2.5%.
+  max_duration: 20.0
 
-  freeze_audio_encoder: false   # true = train the text decoder only (cheaper, usually worse for a new script)
-  use_lora: false               # true = LoRA via peft instead of a full finetune
-  lora_r: 32
+  # A full finetune cannot fit 5 GB: bf16 weights + bf16 grads + fp32 AdamW
+  # moments is ~12x the parameter count in bytes (>7 GB for 0.6B, more once
+  # the audio tower is counted), before a single activation. LoRA keeps the
+  # base frozen in bf16 and only the adapters get grads + optimizer state.
+  freeze_audio_encoder: false   # keep the audio tower adapted too - LoRA makes it affordable
+  use_lora: true
+  # r=64 -> 64.1M trainable (40.4M in the 1024x28 decoder, 23.7M in the
+  # 896x18 audio tower). Bengali is not one of the 30 pretrained languages, so
+  # this is a capability addition, not a style nudge, and 758912 utterances
+  # against 32M params would have underfit. Doubling rank costs only 0.30 GiB
+  # of grads+AdamW; r=128 would cost 1.19 GiB and force the micro-batch down.
+  lora_r: 64
+  # alpha == r (scale 1.0), not the usual 2x: the adapter's scale is how hard
+  # it may pull the frozen base off its pretrained multilingual behaviour.
   lora_alpha: 64
   lora_dropout: 0.05
-  lora_target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  # Two naming conventions in one model, so both must be listed or half the
+  # net is silently left frozen:
+  #   decoder (28 layers)     q_proj k_proj v_proj o_proj gate_proj up_proj down_proj
+  #   audio tower (18 layers) q_proj k_proj v_proj out_proj fc1 fc2
+  #   audio->text projector   linear_1 linear_2
+  # With only the decoder names, the audio tower got adapters on q/k/v alone -
+  # its attention output and both MLP layers stayed frozen (46.6M trainable).
+  # Bengali phonology is not in the pretrained set, so the acoustic front-end
+  # is precisely what has to move here.
+  lora_target_modules:
+    [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj,
+     out_proj, fc1, fc2, linear_1, linear_2]
+  # NOTE: keep the adapter unmerged when you deploy. An unmerged LoRA is the
+  # only hard guarantee here - `disable_adapter()` restores the original
+  # multilingual model bit-for-bit, and you can serve Bengali and the base
+  # behaviour from one set of weights. Merging is irreversible.
 
   bf16: true
   gradient_checkpointing: true
-  per_device_train_batch_size: 8
+  # 2 x 16 = effective batch 32. Micro-batch is the memory knob, accumulation
+  # buys back the batch size for free.
+  per_device_train_batch_size: 2
   # Keep at 1 on small GPUs: the loss upcasts logits to fp32, and with a
   # 151936-token vocab an eval batch of 8 allocates ~1.45 GiB of logits alone.
   per_device_eval_batch_size: 1
-  gradient_accumulation_steps: 4
-  learning_rate: 1e-5
-  warmup_steps: 500
-  lr_scheduler_type: linear
+  gradient_accumulation_steps: 16
+  # 1e-4, not the 1e-5 that suited a full finetune - LoRA adapters start at
+  # zero and need a far more aggressive LR to move.
+  learning_rate: 1e-4
+  warmup_steps: 200
+  lr_scheduler_type: cosine
   weight_decay: 0.01
-  num_train_epochs: 3
-  max_steps: -1                 # >0 overrides num_train_epochs
-  eval_steps: 1000
-  save_steps: 1000
+  num_train_epochs: 1
+  # Measured on the 5080 at this exact config: 3.16 s/optimizer-step, peak
+  # 4.29 GiB allocated / 5.06 GiB reserved. 90000 steps = 2.88M utterances =
+  # 3.8 epochs over the 753378 that survive the 20 s cap, ~3.3 days of pure
+  # compute and ~3.5 days wall clock once eval and checkpointing are counted.
+  max_steps: 90000
+  # 2000 optimizer steps is ~64k utterances of progress between evals.
+  eval_steps: 2000
+
+  # Dev WER/CER during training. The Trainer has no compute_metrics, so
+  # without this the run reports eval_loss only - and cross-entropy over a
+  # 151936-token vocab says little about how many words are actually wrong.
+  # Scored with the live model (a second copy would not fit alongside the
+  # optimizer states), so this costs wall clock, not VRAM: ~500 utterances at
+  # batch 2 is a few minutes every 2000 steps.
+  dev_wer_manifest: data/dev_small.json
+  # Every 500 steps is ~27 min of training, so the WER pass has to be short or
+  # it eats the run: 500 utterances at batch 2 would be ~15-20% overhead at
+  # this cadence. 200 keeps it near 5%. That is a noisier WER (roughly +/-1-2
+  # points absolute) but it is a curve to watch, not a number to report - the
+  # final figure comes from eval.py over the full test manifest.
+  dev_wer_every_steps: 500
+  dev_wer_utterances: 200
+  dev_wer_batch_size: 2
+  dev_wer_max_new_tokens: 128
+  dev_wer_normalize: true      # strip punctuation / fold whitespace before scoring
+  save_steps: 2000
   logging_steps: 25
   save_total_limit: 3
-  dataloader_num_workers: 8
+  dataloader_num_workers: 4
   seed: 42
   report_to: wandb              # or "none"
-  run_name: qwen3-asr-bn-v1
+  run_name: qwen3-asr-bn-lora-r64-1200h
 
   # Transcribe one fixed clip every N steps so progress is visible as text,
   # not just loss. Audio is ~13 tokens/second and this runs with the optimizer
   # states resident, so sample_max_seconds is a real memory knob on small GPUs.
-  sample_audio: "data/samples/sample.mp3"
+  sample_audio: "data/samples/sample.wav"
   sample_every_steps: 200
   sample_max_seconds: 20
   sample_max_new_tokens: 256
-  sample_reference: null
+  sample_reference: "আচ আচ্ছা ঠিক আছে কালকে তো যাচ্ছি কালকে যেয়ে আপনাদের দোকানে গিয়ে থালে সব কিছু দেখে আর হচ্ছে বই কিনে নিয়ে আসব ঠিক আছে হ্যাঁ হ্যাঁ ঠিক আছে রাখছি হ্যাঁ"
 
 # ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
 eval:
-  model_path: experiments/qwen3-asr-bn
+  # LoRA checkpoint dir (has adapter_config.json) - load_model_and_processor
+  # reads its base_model_name_or_path and loads the adapter on top of that.
+  # This is the checkpoint selected at the end of training: best dev WER
+  # among checkpoints actually saved (17.77% at step 72000; the run was
+  # stopped early once dev WER plateaued). See its PRESERVED.md for the full
+  # provenance and the known English/Hindi language-collapse caveat.
+  model_path: experiments/preserved/checkpoint-72000-wer17.77
   manifest: data/test_manifest.json
   language_tag: Bengali
   batch_size: 8
-  max_new_tokens: 256
+  # Unset (null) so generation is sized per batch from that batch's longest
+  # clip instead of one fixed number - the test manifest has utterances up to
+  # 26.6s, and a flat 256 (the old value) truncates anything past a few
+  # seconds, inflating WER with deletion errors. Set an int here only to
+  # force a fixed cap.
+  max_new_tokens: null
   normalize: true               # strip punctuation / fold whitespace before scoring
-  output_predictions: experiments/qwen3-asr-bn/predictions.jsonl
+  output_predictions: experiments/preserved/checkpoint-72000-wer17.77/test_predictions.jsonl

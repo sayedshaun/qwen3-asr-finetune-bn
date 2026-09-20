@@ -119,3 +119,110 @@ class SampleTranscriptionCallback(TrainerCallback):
     def on_train_begin(self, args, state, control, model=None, **kwargs):
         if model is not None:
             self._run(model, 0)
+
+
+class DevWerCallback(TrainerCallback):
+    """Scores WER/CER on a dev manifest every N steps, during training.
+
+    eval_loss tells you the run is converging but not whether the transcripts
+    are any good, and cross-entropy on a 151936-token vocab is a poor proxy
+    for word errors. This transcribes a fixed dev slice with the *live* model
+    rather than loading a second copy - on a 16 GB card already holding the
+    optimizer states there is no room for two.
+
+    Generation is the expensive part, so keep `utterances` small: it runs
+    inside the training loop and every second spent here is a second not
+    spent on gradient steps.
+    """
+
+    def __init__(
+        self,
+        processor,
+        manifest: str,
+        language_tag: str = "Bengali",
+        every_n_steps: int = 2000,
+        utterances: int = 500,
+        batch_size: int = 2,
+        max_new_tokens: int = 128,
+        max_duration: float = 20.0,
+        normalize_text: bool = True,
+        seed: int = 42,
+    ):
+        import random
+
+        from src.dataset import load_manifest
+
+        entries = load_manifest(manifest, 0.5, max_duration)
+        if utterances and utterances < len(entries):
+            entries = random.Random(seed).sample(entries, utterances)
+        self.paths = [e["audio_filepath"] for e in entries]
+        self.refs = [e["text"] for e in entries]
+        self.processor = processor
+        self.language_tag = language_tag
+        self.every = every_n_steps
+        self.batch_size = batch_size
+        self.max_new_tokens = max_new_tokens
+        self.normalize_text = normalize_text
+        print(
+            f"[dev-wer] every {every_n_steps} steps on {len(self.paths)} utterances "
+            f"from {manifest}"
+        )
+
+    def _score(self, model, step: int) -> None:
+        import jiwer
+
+        from src.evaluation import normalize, parse_output, transcribe_batch
+
+        was_training = model.training
+        cache_was = getattr(model.config, "use_cache", False)
+        model.eval()
+        model.config.use_cache = True
+        try:
+            hyps = []
+            for i in range(0, len(self.paths), self.batch_size):
+                hyps.extend(
+                    transcribe_batch(
+                        model,
+                        self.processor,
+                        self.paths[i : i + self.batch_size],
+                        self.language_tag,
+                        self.max_new_tokens,
+                    )
+                )
+            hyps = [parse_output(h) for h in hyps]
+            refs, preds = self.refs, hyps
+            if self.normalize_text:
+                refs = [normalize(r) for r in refs]
+                preds = [normalize(h) for h in preds]
+            # jiwer errors on an empty reference, and an empty hypothesis is a
+            # real (total-deletion) error we must not silently drop.
+            pairs = [(r, h) for r, h in zip(refs, preds) if r]
+            wer = jiwer.wer([r for r, _ in pairs], [h or " " for _, h in pairs])
+            cer = jiwer.cer([r for r, _ in pairs], [h or " " for _, h in pairs])
+            print(
+                f"\n[dev-wer @ step {step}] WER {wer*100:.2f}%  CER {cer*100:.2f}%  "
+                f"({len(pairs)} utterances)"
+            )
+            try:
+                import wandb
+
+                if wandb.run is not None:
+                    wandb.log(
+                        {"eval/dev_wer": wer, "eval/dev_cer": cer}, step=step
+                    )
+            except ImportError:
+                pass
+        except torch.OutOfMemoryError:
+            print(
+                f"\n[dev-wer @ step {step}] skipped - OOM during generation; "
+                f"lower train.dev_wer_batch_size"
+            )
+            torch.cuda.empty_cache()
+        finally:
+            model.config.use_cache = cache_was
+            if was_training:
+                model.train()
+
+    def on_step_end(self, args, state, control, model=None, **kwargs):
+        if model is not None and self.every > 0 and state.global_step % self.every == 0:
+            self._score(model, state.global_step)

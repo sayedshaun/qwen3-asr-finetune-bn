@@ -16,7 +16,7 @@ from transformers import (
     TrainingArguments,
 )
 
-from src.callbacks import SampleTranscriptionCallback
+from src.callbacks import DevWerCallback, SampleTranscriptionCallback
 from src.dataset import ConversationCollator, ManifestDataset
 
 
@@ -110,6 +110,27 @@ def run_training(args, resume_from_checkpoint=None):
                 max_new_tokens=getattr(args, "sample_max_new_tokens", 256),
                 max_seconds=getattr(args, "sample_max_seconds", 20.0),
                 reference=getattr(args, "sample_reference", None),
+            )
+        )
+
+    # WER on the dev set at a fixed cadence. eval_loss alone does not tell you
+    # whether the transcripts are usable, and this scores with the live model
+    # so no second copy has to fit in VRAM.
+    dev_wer_manifest = getattr(args, "dev_wer_manifest", None) or getattr(
+        args, "val_manifest", None
+    )
+    if dev_wer_manifest and getattr(args, "dev_wer_every_steps", 0):
+        callbacks.append(
+            DevWerCallback(
+                processor,
+                dev_wer_manifest,
+                args.language_tag,
+                every_n_steps=args.dev_wer_every_steps,
+                utterances=getattr(args, "dev_wer_utterances", 500),
+                batch_size=getattr(args, "dev_wer_batch_size", 2),
+                max_new_tokens=getattr(args, "dev_wer_max_new_tokens", 128),
+                max_duration=args.max_duration,
+                normalize_text=getattr(args, "dev_wer_normalize", True),
             )
         )
 
