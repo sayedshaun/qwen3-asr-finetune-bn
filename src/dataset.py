@@ -8,6 +8,11 @@ and the target goes in the assistant turn as `language <NAME><asr_text><text>`.
 Keeping that prefix (rather than training on the bare transcript) preserves the
 pretrained language-identification behaviour, which is what the model card
 tells you to do.
+
+That prefix is inside the loss, so what goes in it matters: train only on
+Bengali rows and the model learns to answer "language Bengali" to every input,
+whatever it hears. Rows may therefore carry a `language` field that overrides
+the run's tag, which is how non-Bengali replay utterances keep their own.
 """
 
 import json
@@ -42,7 +47,16 @@ def load_manifest(
                 skipped["missing"] += 1
                 continue
             entries.append(
-                {"audio_filepath": e["audio_filepath"], "text": text, "duration": dur}
+                {
+                    "audio_filepath": e["audio_filepath"],
+                    "text": text,
+                    "duration": dur,
+                    # Per-utterance override of the run's language tag. Bengali
+                    # rows leave this unset; multilingual replay rows carry
+                    # their own ("English", "Hindi", ...) so the language
+                    # prefix they train on stays correct.
+                    "language": e.get("language"),
+                }
             )
     total_skipped = sum(skipped.values())
     print(
@@ -87,7 +101,9 @@ class ManifestDataset(Dataset):
 
     def __getitem__(self, i: int) -> list:
         e = self.entries[i]
-        return build_conversation(e["audio_filepath"], e["text"], self.language_tag)
+        return build_conversation(
+            e["audio_filepath"], e["text"], e.get("language") or self.language_tag
+        )
 
 
 class ConversationCollator:
