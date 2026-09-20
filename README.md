@@ -51,14 +51,32 @@ Qwen3-ASR needs **transformers >= 5.13.0**; earlier versions cannot load
 `Qwen3ASRForConditionalGeneration`. Use **peft >= 0.21**; older releases fail against
 transformers 5.x with `ImportError: cannot import name 'HybridCache'`.
 
+## Data (already on disk)
+
+`data/` reuses the corpus `conformer-training-pipeline` already downloaded, so
+**`prepare_data.py` does not need to be run** — doing so would re-fetch ~85G.
+
+```
+data/wavs -> ../conformer-training-pipeline/data/wavs   symlink, 104G, 788372 clips
+data/train_manifest.json   758912 utts / 1208 h   (after 0.5–30 s filtering)
+data/dev_manifest.json       5198 utts /    8 h
+data/test_manifest.json     10310 utts /   16 h
+data/samples/sample.wav    the clip the training callback transcribes
+```
+
+Manifest paths are relative to the project root, so run every command from this
+directory. To rebuild the corpus from scratch instead, delete `data/` and see
+`prepare_data.py` plus the `data.sources` block in `config.yaml`.
+
 ## Run
 
 ```bash
-python prepare_data.py                      # every source in config.yaml
-python prepare_data.py --dataset fleurs     # one source, for a fast first pass
 python train.py
 python eval.py
 python infer.py sample.wav
+
+python prepare_data.py                      # only to rebuild data/ from scratch
+python prepare_data.py --dataset fleurs     # one source, for a fast first pass
 ```
 
 Every entrypoint takes `--set key=value` overrides against its config section:
